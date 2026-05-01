@@ -2,6 +2,120 @@
 
 Multi-LLM hypothesis engine over open biomedical data. Multi-domain AI portfolio for NL startup visa application alongside Wetzoek.
 
+## 2026-05-01 — Bio downloads + parsing + embed pipeline live
+
+### Downloads complete (~57 GB on hh-storage `/storage/bio/`)
+
+| Source | Size | Items | Status |
+|---|---|---|---|
+| ClinVar XML (`ClinVarVCVRelease_00-latest.xml.gz`) | 5.4 GB | ~2.5M variants | ✅ DONE |
+| UniProt SwissProt (`uniprot_sprot.dat.gz`) | 661 MB | 570K curated proteins | ✅ DONE |
+| PubMed baseline (1500 .xml.gz files) | 51 GB | ~36M abstracts (will filter to bio) | ✅ DONE |
+| Open Targets parquet (diseases subdir) | 176 MB | 28K diseases | 🟡 partial — `bio-ot-download.service` continues remaining 8 subdirs |
+| DisGeNET, OpenSNP | — | — | ❌ skipped (auth-gated / dead URLs) |
+
+### Naming bug discovered & fixed
+ClinVar URL renamed by NCBI: `ClinVarFullRelease_00-latest.xml.gz` → `ClinVarVCVRelease_00-latest.xml.gz` (VCV = Variation Centric View, current format since 2024). Daemon updated.
+
+PubMed naming: was `pubmed25n*` (2025) → now `pubmed26n*` (2026 release year). Daemon hard-coded 25, replaced 335 zero-byte placeholder files, restarted with correct pattern.
+
+### Parsing pipeline (CPU on hh-storage, streaming XML — low RAM)
+
+`/storage/bio/parse_bio_all.py` — uses `ET.iterparse` (streaming, ~14 MB RAM regardless of file size).
+
+| Source | Output | Items | Status |
+|---|---|---|---|
+| ClinVar | `parsed/clinvar.jsonl` 810 MB | 2.5M | ✅ DONE |
+| UniProt | `parsed/uniprot.jsonl` 110 MB | 570K | ✅ DONE |
+| Open Targets diseases | `parsed/open_targets.jsonl` 5.5 MB | 28K | ✅ DONE |
+| PubMed FILTERED (MeSH bio + year≥2015 + abstract>200) | `parsed/pubmed_bio.jsonl` | ~5-8M expected | 🟢 running |
+
+PubMed filter strategy explained at length to user:
+- 36M total → filter to ~15-20% bio-relevant
+- KEEP MeSH: Neoplasms, Genetics, Drug Repositioning, Mutation, Pharmacogenetics, Clinical Trials as Topic, Molecular Targeted Therapy, Precision Medicine, etc.
+- SKIP MeSH: Pediatric Surgery, Public Health, Hospital Management, Diet Therapy
+- Year ≥ 2015 (recent research only)
+- Abstract length > 200 chars (skip editorials/letters)
+
+### Embedding pipeline on GPU2 (RTX 4060 Ti, 16 GB VRAM)
+
+User: "на гпу 2 пока нет юхеров и до понедельника их небудет типо можно использовать видеокарту" — GPU2 (refuge.help speech-gateway) has no users until Monday, OK to use GPU.
+
+- **bge-m3 server** on GPU2 port 8005 (port 8003 occupied by SSH tunnel) — `bge-m3.service` systemd Restart=always
+- **`bio_embed_parallel.py`** spawns N workers, each handling JSONL chunk
+- **`bio_embed_chunk.py`** per-worker, batch=64, infinite retry on bge-m3 fail (NEVER zero-fills)
+- **2 workers** optimal (4 was OOM with 16 GB VRAM at batch 128)
+- **Per-chunk `embed_progress.txt`** for crash-resume
+- **Periodic rsync */15 min** → `hh-storage:/storage/bio/embed/` (incremental, --append-verify)
+- **systemd `bio-embed-clinvar.service`** Restart=on-failure (enabled, won't disrupt running)
+
+Combined rate: 122/s (61/s × 2 workers). ClinVar 4.49M / 122 = ~10 hours ETA.
+
+### Bug fixed: silent zero-fill corruption in HippoRAG embed
+
+Discovered overnight that bge-m3 server died on GPU1 (after vast.ai bounce — no systemd auto-start), and `embed_entities_v2.py` silently filled failed batches with zero vectors, corrupting ~700K rows in `entity_emb.f32`. Patches applied across HippoRAG + bio pipeline:
+
+```python
+# OLD (silent corruption):
+except: vecs = [[0.0] * DIM for _ in batch]
+
+# NEW (infinite retry, no zeros):
+while vecs is None:
+    attempt += 1; sleep(min(60, 5*attempt))
+    try: vecs = post_embed(batch)
+    except: ...
+    if attempt > 30: raise RuntimeError
+```
+
+Plus `/root/scan_and_repair_zeros.py` tool — for future, scan f32 for zero rows and re-embed only those rows (instead of full restart).
+
+### Auto-recovery (5 layers per pipeline)
+
+1. **bge-m3 systemd** Restart=always — survives vast.ai bounce
+2. **Embed script infinite retry** — no silent corruption on bge-m3 fail
+3. **Per-chunk progress.txt** — resume exact row on crash
+4. **systemd embedder service** — on-failure restart
+5. **Periodic rsync** — progress safely on hh-storage even if GPU2 dies
+
+### Telegram alerts (correct bot 8249459459 — i online channel, NOT @prmdleadbot)
+
+- 🧬 daemon started
+- 📚 PubMed every 50 files
+- 📊 Open Targets each subdir
+- ✅ source done
+- 🚨 bge-m3 down (>5 min cron healthcheck)
+- 🎉 all complete with summary
+
+### Final ETA (everything done)
+
+```
+ClinVar embed: ~10h → done ~02:00 UTC 2026-05-02
+UniProt embed: ~2h
+Open Targets:  ~5 min
+PubMed bio embed: ~12-16h after parse done
+
+ALL embeddings on hh-storage by Sunday morning
+```
+
+### Files / paths (canonical)
+
+- Raw downloads: `hh-storage:/storage/bio/{clinvar,uniprot,pubmed,open_targets,disgenet,opensnp}/`
+- Parsed JSONL: `hh-storage:/storage/bio/parsed/<source>.jsonl`
+- Embeddings (during): `gpu2:/root/bio_embed/<source>/chunk_<N>/{emb.f32,ids.json,embed_progress.txt}`
+- Embeddings (after rsync): `hh-storage:/storage/bio/embed/<source>/chunk_<N>/...`
+- Daemon: systemd `bio-download.service` (single-file sources), `bio-ot-download.service` (Open Targets parquet), `bio-embed-<source>.service` (per source)
+- bge-m3 (embedder backend): `gpu2:/root/bge_m3_server.py` :8005, systemd `bge-m3.service`
+- Status check: `ssh root@hh-storage '/storage/bio/status.sh'`
+
+### Open TODO
+
+- [ ] After ClinVar embed done → start UniProt + Open Targets embed (2 sources, can run sequentially or parallel)
+- [ ] After PubMed parse done → embed bio subset
+- [ ] Build query layer / Frankenstein-bio (multi-LLM consensus over all sources) — can start now in parallel
+- [ ] Decide inference deployment (most likely GPU3 with all source memmap files for cosine + cross-source bridges)
+- [ ] Demo for NL universities (AMC, LUMC, Erasmus MC, UMCG, Radboud)
+
+
 ## 2026-04-30 — Project init
 
 ### Strategic positioning
